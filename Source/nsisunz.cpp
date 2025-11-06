@@ -472,6 +472,33 @@ void internal_unzip(int uselog)
 					} while (l > 0);
 
 					fclose(fp);
+
+					// preserve timestamp
+					{
+						FILETIME ftCreate, ftAccess, ftWrite;
+						SYSTEMTIME st;
+						HANDLE hFile = CreateFile(out_filename, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+						if (hFile != INVALID_HANDLE_VALUE)
+						{
+							// populate SYSTEMTIME from unz_file_info
+							st.wYear = fileinfo.tmu_date.tm_year;
+							st.wMonth = fileinfo.tmu_date.tm_mon;
+							st.wDay = fileinfo.tmu_date.tm_mday;
+							st.wHour = fileinfo.tmu_date.tm_hour;
+							st.wMinute = fileinfo.tmu_date.tm_min;
+							st.wSecond = fileinfo.tmu_date.tm_sec;
+							st.wMilliseconds = 0;
+
+							// convert SYSTEMTIME to FILETIME
+							if (SystemTimeToFileTime(&st, &ftWrite))
+							{
+								// optionally set create/access times to same as modified
+								ftCreate = ftAccess = ftWrite;
+								SetFileTime(hFile, &ftCreate, &ftAccess, &ftWrite);
+							}
+							CloseHandle(hFile);
+						}
+					}
 				}
 				else
 				{
