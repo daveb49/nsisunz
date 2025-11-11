@@ -1,110 +1,49 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.20)
+project(nsisunz_unicode LANGUAGES C CXX)
 
-if(NOT WIN32)
-	message( FATAL_ERROR "Only supports Windows" )
+# Force UNICODE for NSIS
+add_definitions(-DUNICODE -D_UNICODE)
+
+# Set output directories for binaries and libraries
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# --- Add minizip-ng as a subdirectory ---
+# Assumes minizip-ng source is in a subfolder
+add_subdirectory(minizip-ng)
+
+# --- Copy official NSIS plugin API lib into build tree ---
+set(NSIS_PLUGIN_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../nsis-3.11-src/build/urelease/api/nsis/pluginapi-amd64-unicode.lib")
+set(NSIS_PLUGIN_LIB_DEST "${CMAKE_CURRENT_BINARY_DIR}/libs")
+
+if(NOT EXISTS "${NSIS_PLUGIN_LIB_DEST}/pluginapi-amd64-unicode.lib")
+    file(MAKE_DIRECTORY "${NSIS_PLUGIN_LIB_DEST}")
+    file(COPY "${NSIS_PLUGIN_LIB}" DESTINATION "${NSIS_PLUGIN_LIB_DEST}")
 endif()
 
-OPTION(STATIC_MSVC_RUNTIME "Static MSVC CRT" ON)
+# --- Define the nsisunz plugin target ---
+add_library(nsisunz_unicode SHARED
+    nsisunz.cpp
+    # add other source files if needed
+)
 
-macro(configure_msvc_runtime)
-  if(MSVC)
-    # Set compiler options.
-    set(variables
-      CMAKE_C_FLAGS_DEBUG
-      CMAKE_C_FLAGS_MINSIZEREL
-      CMAKE_C_FLAGS_RELEASE
-      CMAKE_C_FLAGS_RELWITHDEBINFO
-      CMAKE_CXX_FLAGS_DEBUG
-      CMAKE_CXX_FLAGS_MINSIZEREL
-      CMAKE_CXX_FLAGS_RELEASE
-      CMAKE_CXX_FLAGS_RELWITHDEBINFO
-    )
-    if(STATIC_MSVC_RUNTIME)
-      message(STATUS
-        "MSVC -> forcing use of statically-linked runtime."
-      )
-      foreach(variable ${variables})
-        if(${variable} MATCHES "/MD")
-          string(REGEX REPLACE "/MD" "/MT" ${variable} "${${variable}}")
-        endif()
-      endforeach()
-    else()
-      message(STATUS
-        "MSVC -> forcing use of dynamically-linked runtime."
-      )
-      foreach(variable ${variables})
-        if(${variable} MATCHES "/MT")
-          string(REGEX REPLACE "/MT" "/MD" ${variable} "${${variable}}")
-        endif()
-      endforeach()
-    endif()
-  endif()
-endmacro()
+# --- Link libraries ---
+target_link_libraries(nsisunz_unicode PRIVATE
+    minizip
+    zlibstatic
+    "${NSIS_PLUGIN_LIB_DEST}/pluginapi-amd64-unicode.lib"
+)
 
-configure_msvc_runtime()
+# --- Include directories ---
+target_include_directories(nsisunz_unicode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    minizip-ng
+)
 
-set(CMAKE_CXX_STANDARD 11)
-
-###########################
-# zlib
-
-set(SKIP_INSTALL_ALL ON) # do not install zlib
-
-add_subdirectory(zlib)
-
-include_directories(zlib)
-include_directories(${CMAKE_CURRENT_BINARY_DIR}/zlib)
-
-
-###########################
-# miniunzip
-
-add_library(miniunzip STATIC minizip/ioapi.c minizip/iowin32.c minizip/miniunz.c minizip/unzip.c)
-target_link_libraries(miniunzip zlibstatic)
-
-
-###########################
-# nsisunz
-
-set(SOURCE_FILES nsisunz.cpp nsis/pluginapi.c)
-
-if(CMAKE_VS_PLATFORM_NAME MATCHES "^([Ww][Ii][Nn]32)|([Xx]86)|([Xx]64)$")
-	# ANSI / MBCS DLL
-	add_library(nsisunz_ansi MODULE ${SOURCE_FILES})
-	set_target_properties(nsisunz_ansi PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}")
-	set_target_properties(nsisunz_ansi PROPERTIES RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_BINARY_DIR}")
-	set_target_properties(nsisunz_ansi PROPERTIES LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}")
-	set_target_properties(nsisunz_ansi PROPERTIES LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_BINARY_DIR}")
-	install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nsisunz_ansi.dll"
-		RENAME "nsisunz.dll"
-		COMPONENT Plugins DESTINATION "Plugins/ansi")
-	target_link_libraries(nsisunz_ansi zlibstatic miniunzip)
-endif()
-
-# Unicode DLL
-add_library(nsisunz_unicode MODULE ${SOURCE_FILES})
-target_compile_definitions(nsisunz_unicode PRIVATE "UNICODE" "_UNICODE")
-set_target_properties(nsisunz_unicode PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}")
-set_target_properties(nsisunz_unicode PROPERTIES RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_BINARY_DIR}")
-set_target_properties(nsisunz_unicode PROPERTIES LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}")
-set_target_properties(nsisunz_unicode PROPERTIES LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_BINARY_DIR}")
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nsisunz_unicode.dll"
-		RENAME "nsisunz.dll"
-		COMPONENT Plugins DESTINATION "Plugins/unicode")
-target_link_libraries(nsisunz_unicode zlibstatic miniunzip)
-
-
-###########################
-# Additional Install Rules
-
-# Copy the source files over into the "Source" folder
-file(GLOB SRC_FILES "*.txt" "*.cpp" "*.c" "*.h")
-INSTALL(FILES ${SRC_FILES}
-		COMPONENT "Source" DESTINATION "Source")
-INSTALL(DIRECTORY "minizip"
-		COMPONENT "Source" DESTINATION "Source")
-INSTALL(DIRECTORY "nsis"
-		COMPONENT "Source" DESTINATION "Source")
-INSTALL(DIRECTORY "zlib"
-		COMPONENT "Source" DESTINATION "Source")
-
+# Optional: set C++ standard
+set_target_properties(nsisunz_unicode PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)

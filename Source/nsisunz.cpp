@@ -1,619 +1,311 @@
 // Unicode NSIS support by Gringoloco023, http://portableapps.com/node/21879, Februari 6 2010
 // Improvements by past-due, https://github.com/past-due/, 2018+
-/*
-UnZip Plug-in for NSIS
-Written by Saivert
+// Timestamp fixups by daveb, now extracts like 7zip preserving modified times, Nov 2025
 
-Credits:
-  - Based on code in NSIS Zip2Exe
-    portions Copyright � 1999-2001 Miguel Garrido (mgarrido01@hotmail.com)
-  - Uses ZLIB - Copyright � Mark Adler
-  - ZIP format routines - Copyright (C) 1998 Gilles Vollant
+#ifndef UNICODE
+#error "This plugin only supports UNICODE NSIS builds."
+#endif
+#define _CRT_SECURE_NO_WARNINGS
 
-  Even though this project is an NSIS Plug-in, it also
-  exports a function that can be used by any applications.
-  The exported function is "appextract"
-*/
-//#include "AggressiveOptimize.h"
 #include <windows.h>
 #include <stdio.h>
 #include <commctrl.h>
+#include <io.h>			// for _get_osfhandle
 #include "nsis/pluginapi.h"
 
-extern "C" {
-#include "minizip/unzip.h"
-};
-
-//Strings used all over the place
-TCHAR szSuccess[]        = {_T('s'),_T('u'),_T('c'),_T('c'),_T('e'),_T('s'),_T('s'),_T('\0')};
-TCHAR szFile[]           = {_T('/'),_T('f'),_T('i'),_T('l'),_T('e'),_T('\0')};
-TCHAR szNoextractpath[]  = {_T('/'),_T('n'),_T('o'),_T('e'),_T('x'),_T('t'),_T('r'),_T('a'),_T('c'),_T('t'),_T('p'),_T('a'),_T('t'),_T('h'),_T('\0')};
-TCHAR szDefExtractText[] = {_T('E'),_T('x'),_T('t'),_T('r'),_T('a'),_T('c'),_T('t'),_T(':'),_T(' '),_T('%'),_T('f'),_T('\0')};
-
-TCHAR g_extract_text[1024];
-
-int g_extracting;
-HWND g_hwndParent;
-TCHAR tempzip_path[1024];
-
-void internal_unzip(int);
-
-CRITICAL_SECTION cs;
-
-//Log stuff
-HWND g_hwndList;
-HWND g_hwndStatus;
-void LogMessage(HWND, const TCHAR *, int = 0);
-
-#ifdef UNICODE
-	char * _T2A(wchar_t *str);
-	wchar_t * _A2T(char *str);
-	#define _tfopen_s _wfopen_s
-#else
-	#define _T2A(x) (x)
-	#define _A2T(x) (x)
-	#define _tfopen_s fopen_s
+#ifdef _MSC_VER
+#pragma comment(lib, "pluginapi-amd64-unicode.lib")
 #endif
+#pragma comment(lib,"Shlwapi.lib")
 
-extern "C" BOOL WINAPI DllMain(HANDLE hInst, ULONG ul_reason_for_call, LPVOID lpReserved)
+#include "minizip-ng/mz.h"
+#include "minizip-ng/mz_strm.h"
+#include "minizip-ng/mz_zip.h"
+#include "minizip-ng/mz_zip_rw.h"
+#include <shlwapi.h> // for PathRemoveFileSpec
+
+static HWND g_hwndParent = NULL;
+static HWND g_hListView = NULL;
+
+void internal_unzip(int uselog);
+
+void doMKDir(const TCHAR* dir) {
+	if (!dir || !*dir)
+		return;
+
+	TCHAR path[MAX_PATH];
+	lstrcpyn(path, dir, MAX_PATH);
+
+	// Normalize slashes
+	for (TCHAR* p = path; *p; ++p)
+		if (*p == _T('/')) *p = _T('\\');
+
+	// Skip drive letter or UNC root
+	TCHAR* p = path;
+	if (path[0] == _T('\\') && path[1] == _T('\\')) {
+		// Skip \\server\share\ ...
+        p = path + 2;
+		int slashCount = 0;
+		while (*p && slashCount < 2) {
+			if (*p == _T('\\'))
+				slashCount++;
+			++p;
+		}
+	}
+	else if (path[1] == _T(':'))
+		p = path + 3; // skip "C:\"
+
+	for (; *p; ++p) {
+		if (*p == _T('\\')) {
+			*p = 0;
+			CreateDirectory(path, NULL);
+			*p = _T('\\');
+		}
+	}
+	CreateDirectory(path, NULL);
+}
+
+extern "C" __declspec(dllexport)
+void Unzip(HWND hwndParent, int string_size, TCHAR* variables, stack_t** stacktop) {
+	EXDLL_INIT();
+	g_hwndParent = hwndParent;
+	g_stacktop = stacktop;		// Set the global stack pointer for popstring/pushstring
+	internal_unzip(0);			// silent
+}
+
+extern "C" __declspec(dllexport)
+void UnzipToLog(HWND hwndParent, int string_size, TCHAR* variables, stack_t** stacktop) {
+	EXDLL_INIT();
+	g_hwndParent = hwndParent;
+	g_stacktop = stacktop;
+	internal_unzip(1);			// log each file via DetailPrint
+}
+
+// Converts wide string (TCHAR*) to UTF-8 encoded ANSI char*
+static char* _T2A(const TCHAR* wideStr) {
+	static char buf[1024];
+	if (!wideStr) { buf[0] = 0; return buf; }
+
+	// Determine required buffer size
+	int len = WideCharToMultiByte(CP_UTF8, 0, wideStr, -1, NULL, 0, NULL, NULL);
+	if (len > (int)sizeof(buf)) len = sizeof(buf) - 1;
+
+	WideCharToMultiByte(CP_UTF8, 0, wideStr, -1, buf, len, NULL, NULL);
+	buf[len] = 0;
+	return buf;
+}
+
+// Converts UTF-8 ANSI char* to wide string (TCHAR*)
+static TCHAR* _A2T(const char* ansiStr) {
+	static TCHAR buf[1024];
+	if (!ansiStr) { buf[0] = 0; return buf; }
+
+	int len = MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, NULL, 0);
+	if (len > (int)(sizeof(buf) / sizeof(TCHAR))) len = (sizeof(buf) / sizeof(TCHAR)) - 1;
+
+	MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, buf, len);
+	buf[len] = 0;
+	return buf;
+}
+
+// Callback for EnumChildWindows to find SysListView32
+static BOOL CALLBACK FindListViewProc(HWND hwnd, LPARAM lParam)
 {
-	switch (ul_reason_for_call)
+	TCHAR className[64];
+	GetClassName(hwnd, className, 64);
+	if (_tcscmp(className, _T("SysListView32")) == 0)
 	{
-	//case DLL_THREAD_ATTACH:
-	case DLL_PROCESS_ATTACH:
-		InitializeCriticalSection(&cs);
-		break;
-	//case DLL_THREAD_DETACH:
-	case DLL_PROCESS_DETACH:
-		DeleteCriticalSection(&cs);
-		break;
+		*(HWND*)lParam = hwnd;
+		return FALSE; // stop enumeration
 	}
 	return TRUE;
 }
 
-void doMKDir(TCHAR *directory)
-{
-	TCHAR *p, *p2;
-	TCHAR buf[MAX_PATH];
-	if (!*directory) return;
-	lstrcpy(buf,directory);
-	p=buf; while (*p) p++;
-	while (p >= buf && *p != _T('\\')) p--;
-	p2 = buf;
-	if (p2[1] == _T(':')) p2+=4;
-	else if (p2[0] == _T('\\') && p2[1] == _T('\\'))
+// Finds the Details listview window once
+static HWND g_hwndListView = NULL;
+
+BOOL CALLBACK EnumChildProc(HWND hwnd, LPARAM lParam) {
+	TCHAR clsName[64];
+	GetClassName(hwnd, clsName, _countof(clsName));
+	if (_tcscmp(clsName, _T("SysListView32")) == 0)
 	{
-		p2+=2;
-		while (*p2 && *p2 != _T('\\')) p2++;
-		if (*p2) p2++;
-		while (*p2 && *p2 != _T('\\')) p2++;
-		if (*p2) p2++;
+		g_hwndListView = hwnd;
+		return FALSE; // stop enumeration
 	}
-	if (p >= p2)
-	{
-		*p=0;
-		doMKDir(buf);
-	}
-	CreateDirectory(directory,NULL);
+	return TRUE; // continue
 }
 
-//Based on inttosizestr from NSIS exehead project.
-//Creates a string representing the size of a file,
-//choosing the unit that's best suited.
-static TCHAR * FormatDiskSize(TCHAR *str, unsigned long b)
-{
-	TCHAR scale=_T('k');
-	TCHAR sh=30;
-	TCHAR s=0;
-
-	if      (b <= (1024*1024)     ) sh=10, scale=_T('k');
-	else if (b <= (1024*1024*1024)) sh=20, scale=_T('M');
-	else if (GetVersion()&0x80000000) s=_T('+'); //only display '+' on GB shown on Win95
-
-	if (b >= 1000) //represent everything above 1000 bytes as 0,xx kB
-	{
-		wsprintf(str, _T("%d.%d%d %cB%c"),
-			b>>sh, ((b*10)>>sh)%10, ((b*20)>>sh)%10, scale, s);
-		if (b < 1024)
-			wsprintf(str+_tcsclen(str), _T(" (%u byte%c)"), b, b == 1?0:_T('s'));
-	}
-	else
-		wsprintf(str, _T("%u byte%c"), b, b == 1?0:_T('s'));
-
-	return str;
+static HWND FindListView(HWND parent) {
+	g_hwndListView = NULL;
+	EnumChildWindows(parent, EnumChildProc, 0);
+	return g_hwndListView;
 }
 
-/* A simple format parser
- * Handles %f, %c and %u
- * size of out must be twice as large as size of str
- */
-static TCHAR * parse(const TCHAR *str, TCHAR *out, int outlen,
-					TCHAR *filename,
-					unsigned long compressed,
-					unsigned long uncompressed,
-					unsigned int nkb)
-{
-	TCHAR s[32];
-	const TCHAR *p;
-	UINT i=0;
-	p=str-1;
-	memset(out, 0, outlen);
+static void DetailPrint(const TCHAR* msg) {
+	if (!msg || !g_hwndParent) return;
 
-	while (p++ && (*p != 0))
-	{
-		if (*p == _T('%'))
-		{
-			switch (*(p+1))
-			{
-			case _T('c'):
-			case _T('C'):
-			{
-				FormatDiskSize(s, compressed);
-				lstrcat(out, s);
-				i += lstrlen(s);
-				break;
-			}
-			case _T('u'):
-			case _T('U'):
-			{
-				FormatDiskSize(s, uncompressed);
-				lstrcat(out, s);
-				i += lstrlen(s);
-				break;
-			}
-			case _T('f'):
-			case _T('F'):
-			{
-				lstrcat(out, filename);
-				i += lstrlen(filename);
-				break;
-			}
-			case _T('p'):
-			case _T('P'):
-			{
-				unsigned int j;
-				j = uncompressed;
-				if (!j) j = 1;
-				wsprintf(s, _T("%d%%"), nkb*100/j);
-				lstrcat(out, s);
-				i += lstrlen(s);
-				break;
-			}
-			case _T('b'):
-			case _T('B'):
-			{
-				FormatDiskSize(s, nkb);
-				lstrcat(out, s);
-				i += lstrlen(s);
-				break;
-			}
-			default: out[i++] = *p;
-			}
-			++p;
-		} else {
-			out[i++] = *p;
+	if (!g_hwndListView) {
+		g_hwndListView = FindListView(g_hwndParent);
+		if (!g_hwndListView) {
+			// Details window may not exist yet
+			// MessageBox(NULL, _T("SysListView32 not found!"), _T("DetailPrint"), MB_OK);
+			return;
 		}
 	}
-	return out;
+
+	//	TCHAR dbg[1024];
+	//	wsprintf(dbg, TEXT("Inside DetailPrint about to SendMessage to g_hwndListView HWND: 0x%p, [%s]"), g_hwndListView, msg);
+	//	MessageBox(NULL, dbg, TEXT("DetailPrint in plugin debug"), MB_OK);
+
+	LVITEM lvi = {};
+	lvi.mask = LVIF_TEXT;
+	lvi.iItem = ListView_GetItemCount(g_hwndListView); // append
+	lvi.iSubItem = 0;
+	lvi.pszText = (LPTSTR)msg;
+
+	ListView_InsertItem(g_hwndListView, &lvi);
+	ListView_EnsureVisible(g_hwndListView, lvi.iItem, FALSE);
 }
 
-extern "C" __declspec(dllexport)
-void Unzip(HWND hwndParent, int string_size, TCHAR *variables, stack_t **stacktop)
-{
-	EXDLL_INIT();
-	g_hwndParent = hwndParent;
-	internal_unzip(0);
+void ReplaceChar(TCHAR* str, TCHAR find, TCHAR replace) {
+    for (TCHAR* p = str; (p = _tcschr(p, find)) != NULL; ++p) {
+        *p = replace;
+    }
 }
 
-extern "C" __declspec(dllexport)
-void UnzipToLog(HWND hwndParent, int string_size, TCHAR *variables, stack_t **stacktop)
-{
-	EXDLL_INIT();
-	g_hwndParent = hwndParent;
-	internal_unzip(1);
-}
-
-extern "C" __declspec(dllexport)
-void UnzipToStack(HWND hwndParent, int string_size, TCHAR *variables, stack_t **stacktop)
-{
-	EXDLL_INIT();
-	g_hwndParent = hwndParent;
-	internal_unzip(2);
-}
-
-// This function is to be used by rundll32.exe. Call it like this:
-//
-//   rundll32.exe "c:\a path\nsisunz.dll",extract_RunDLL c:\path\zipfile.zip c:\outdir
-//
-// or to extract a single file, use this (concatenate the next two lines):
-//
-//   rundll32.exe c:\path\nsisunz.dll,extract_RunDLL
-//     /file readme.txt "c:\a path\zipfile.zip" c:\outdir
-//
-// "/noextractpath" is implicitly used if "/file" is used.
-// It mimics NSIS itself by setting up a stack and pushing the
-// parameters from the function on the stack. I made it like this
-// so I could directly reuse the code I already had written without modifications.
-extern "C" __declspec(dllexport)
-void extract_RunDLL(HINSTANCE hAppInstance, LPVOID unused, TCHAR *params)
-{
-	TCHAR res[1024];
-	TCHAR temp[256];
-	TCHAR zipfile[MAX_PATH]={0,};
-	TCHAR destdir[MAX_PATH]={0,};
-	TCHAR file[MAX_PATH]={0,};
-	TCHAR *p = params;
-	TCHAR *s;
-	TCHAR q=0;
-	int next=0;
-#define NEXT_FILE 1
-#define NEXT_ZIP  2
-#define NEXT_DEST 3
-
-	stack_t ownstacktop;
-	stack_t *pownstacktop = &ownstacktop;
-
-	ownstacktop.next = NULL;
-	ownstacktop.text[0] = NULL;
-
-	g_stringsize=1024;
-	g_stacktop=&pownstacktop;
-	g_variables=NULL;
-
-	//Parse the parameters
-	//While we do the parsing we use next as a clue to
-	//what comes next. This way I don't have to write a
-	//new function.
-	while (*p)
-	{
-		if (*p==_T('"')) q=_T('"'), p++; else q=_T(' '); //Do we search for a quote or a space?
-		s = temp;
-		while (*p && *p != q) *s++ = *p++; //Copy chars from params to zipfile
-		*s = 0; //Terminate string
-		if (next==NEXT_FILE) lstrcpy(file, temp), next=NEXT_ZIP;
-		else if (next==NEXT_ZIP) lstrcpy(zipfile, temp), next=NEXT_DEST;
-		else if (next==NEXT_DEST) lstrcpy(destdir, temp), next=0;
-		else if (!lstrcmpi(temp, szFile)) next=NEXT_FILE;
-		else lstrcpy(zipfile, temp), next=NEXT_DEST;
-
-		while (*p && *++p == _T(' '));
-	}
-
-	pushstring(destdir);
-	pushstring(zipfile);
-
-	if (file[0])
-	{
-		pushstring(file);
-		pushstring(szFile);
-		pushstring(szNoextractpath);
-	}
-	
-	internal_unzip(0);
-	popstring(res);
-	if (lstrcmp(res, szSuccess))
-		MessageBox(0, res, NULL, MB_ICONERROR);
-}
-
-void internal_unzip(int uselog)
-{
-	//All char baby (or should I use int for the non-string stuff??)
-	TCHAR first=0;
-	TCHAR filefound=0;
-	TCHAR usefile=0;
-	TCHAR hastext=0;
-	TCHAR noextractpath=0;
-	TCHAR filetoextract[MAX_PATH+1];
-	TCHAR buf[1024];
-	TCHAR fn[MAX_PATH+1];
-
-	popstring(buf);
-	while (buf[0] == _T('/'))
-	{
-		if (!lstrcmpi(buf+1, _T("text"))) popstring(g_extract_text), hastext++;
-		if (!lstrcmpi(buf+1, _T("noextractpath"))) noextractpath++;
-		if (!lstrcmpi(buf+1, _T("file")))
-		{
-			TCHAR *p;
-			popstring(filetoextract);
-			// Ensure filename uses backslashes
-			p = filetoextract;
-			while (*p)
-			{
-				if (*p == _T('/')) *p=_T('\\');
-				p++;
-			}
-			usefile++;
-		}
-
-		//if stack is empty, bail out
-		if (popstring(buf))
-			*buf = 0;
-	}
-	//check for first required param
-    if (*buf)
-      lstrcpyn(fn, buf, MAX_PATH);
-    else
-    {
-		pushstring(_T("Error reading ZIP filename parameter"));
-		return;
+void internal_unzip(int uselog) {
+    TCHAR zipPath[MAX_PATH];
+    if (popstring(zipPath)) {
+        pushstring(_T("Error reading ZIP file path"));
+        return;
     }
 
-	if (popstring(tempzip_path))
-	{
-		pushstring(_T("Error reading destination directory parameter"));
-		return;
-	}
+    TCHAR destPath[MAX_PATH];
+    if (popstring(destPath)) {
+        pushstring(_T("Error reading destination directory path"));
+        return;
+    }
 
-	if (uselog==1)
-	{
-		if (!hastext) lstrcpy(g_extract_text, szDefExtractText);
-	}
+    void* reader = mz_zip_reader_create();
+    if (mz_zip_reader_open_file(reader, _T2A(zipPath)) != MZ_OK) {
+        mz_zip_reader_delete(&reader);
+        pushstring(_T("Error opening ZIP file"));
+        return;
+    }
 
-	unzFile f;
-	f = unzOpen(_T2A(fn));
-	if (!f || unzGoToFirstFile(f) != UNZ_OK)
-	{
-		if (f) unzClose(f);
-		pushstring(_T("Error opening ZIP file"));
-		return;
-	}
+    if (mz_zip_reader_goto_first_entry(reader) != MZ_OK) {
+        mz_zip_reader_close(reader);
+        mz_zip_reader_delete(&reader);
+        pushstring(_T("ZIP file has no entries"));
+        return;
+    }
 
-	int nf=0, nb=0;
-	unz_file_info fileinfo;
-	g_extracting=1;
+    // Allocate 1 MB buffer on heap once, reuse for all files unpacked from the zip
+    uint8_t* buffer = (uint8_t*)malloc(1024 * 1024);
+    if (!buffer) {
+        pushstring(_T("Failed to allocate extraction buffer"));
+        mz_zip_reader_close(reader);
+        mz_zip_reader_delete(&reader);
+        return;
+    }
+
+    int filecount = 0;
 	do {
-		char filenameA[MAX_PATH];
-		TCHAR filename[MAX_PATH];
-		unzGetCurrentFileInfo(f,&fileinfo,filenameA,sizeof(filename),NULL,0,NULL,0);
-		lstrcpyn(filename, _A2T(filenameA), MAX_PATH);
+	    mz_zip_file* file_info = nullptr;
+	    if (mz_zip_reader_entry_get_info(reader, &file_info) != MZ_OK || !file_info)
+	        continue;
 
-		if (filename[0] && 
-			filename[_tcsclen(filename)-1] != _T('\\') && 
-			filename[_tcsclen(filename)-1] != _T('/'))
-		{
-			TCHAR *pfn=filename;
-			//ensure path uses backslashes
-			while (*pfn)
-			{
-				if (*pfn == _T('/')) *pfn=_T('\\');
-				pfn++;
-			}
+	    // Convert filename to TCHAR
+	    TCHAR entryName[MAX_PATH];
+	    lstrcpyn(entryName, _A2T(file_info->filename), MAX_PATH);
+        ReplaceChar(entryName, _T('/'), _T('\\'));
 
-			if (usefile)
-			{
-				if (lstrcmpi(filename, filetoextract) != 0) continue;
-				else filefound++;
-			}
-			
-			pfn=filename;
-			if (pfn[1] == _T(':') && pfn[2] == _T('\\')) pfn+=3;
-			while (*pfn == _T('\\')) pfn++;
+        // Skip directory entries
+        if (file_info->uncompressed_size == 0 && _tcschr(entryName, _T('/')) && entryName[_tcslen(entryName) - 1] == _T('/')) {
+            continue;
+        }
+		// Build full output path
+	    TCHAR outFile[MAX_PATH];
+	    lstrcpyn(outFile, destPath, MAX_PATH);
+        if (outFile[_tcslen(outFile) - 1] != _T('\\'))
+            _tcscat(outFile, _T("\\"));
+	    _tcscat(outFile, entryName);
 
-			if (noextractpath)
-			{
-				TCHAR buf[MAX_PATH];
-				lstrcpy(buf,filename);
-				TCHAR *p=buf+_tcsclen(buf);
-				while (p > buf && *p != _T('\\') && *p != _T('/')) p = CharPrev(buf, p);
-				if (p > buf) p++;
-				lstrcpy(filename, p);
-			}
+	    // Ensure directory exists
+	    TCHAR dirBuf[MAX_PATH];
+	    lstrcpyn(dirBuf, outFile, MAX_PATH);
+	    PathRemoveFileSpec(dirBuf);
+	    doMKDir(dirBuf);
 
-			TCHAR out_filename[1024];
-			lstrcpy(out_filename,tempzip_path);
-			lstrcat(out_filename,_T("\\"));
-			lstrcat(out_filename,pfn);
-			if (_tcsstr(pfn,_T("\\")))
-			{
-				TCHAR buf[1024];
-				lstrcpy(buf,out_filename);
-				TCHAR *p=buf+_tcsclen(buf);
-				while (p > buf && *p != _T('\\')) p--;
-				*p=0;
-				if (buf[0]) doMKDir(buf);
-			}
+	    // Open entry and write to disk
+	    if (mz_zip_reader_entry_open(reader) == MZ_OK) {
+	        FILE* fp = nullptr;
+	        _tfopen_s(&fp, outFile, _T("wb"));
+	        if (fp) {
+	            int32_t bytesRead = 0;
+                long totalWritten = 0;
+	            do {
+	                bytesRead = mz_zip_reader_entry_read(reader, buffer, 1024 * 1024);
+                    if (bytesRead > 0) {
+                        fwrite(buffer, 1, bytesRead, fp);
+                        totalWritten += bytesRead;
+                    }
+	            } while (bytesRead > 0);
 
-			if (unzOpenCurrentFile(f) == UNZ_OK)
-			{
-				FILE *fp;
-				int l;
-				fp = _tfopen(out_filename,_T("wb"));
-				if (fp)
-				{
-					if (uselog==1) {
-						TCHAR logtmp[256];
-						parse(g_extract_text, logtmp, sizeof(logtmp),
-							pfn, fileinfo.compressed_size, fileinfo.uncompressed_size, 0);
-						LogMessage(g_hwndParent, logtmp);
-					} else if (uselog == 2) {
-						if (!first)
-						{
-							pushstring(_T("")); //push list terminator (empty string)
-							first++;
-						}
-						pushstring(pfn);
-					}
-					nb=0;
-					do
-					{
-						TCHAR buf[1024];
-						l=unzReadCurrentFile(f,buf,sizeof(buf));
-						if (l > 0) 
-						{
-							if (fwrite(buf,1,l,fp) != (unsigned int)l)
-							{
-								unzClose(f);
-								fclose(fp);
-								pushstring(_T("Error writing output file(s)"));
-								g_extracting=0;
-								return;
-							}
+                // --- Set exact file timestamp (local ZIP wall-clock) ---
+                fflush(fp); // ensure all data is written
 
-							if (!g_extracting)
-							{
-								unzClose(f);
-								fclose(fp);
-								g_extracting=0;
-								pushstring(_T("aborted"));
-								return;
-							}
-						}
+                int fd = _fileno(fp);
+                HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+                if (hFile != INVALID_HANDLE_VALUE) {
+					time_t mod_time = (time_t)file_info->modified_date;
 
-						if (uselog==1 && (nb % 1024))
-						{
-							TCHAR logtmp[256];
-							parse(g_extract_text, logtmp, sizeof(logtmp),
-								pfn, fileinfo.compressed_size,
-								fileinfo.uncompressed_size, nb);
-							LogMessage(g_hwndParent, logtmp, 1);
-						}
-						nb += l;
-					} while (l > 0);
+					// Convert to broken-down local time (tm)
+					struct tm t_local;
+					localtime_s(&t_local, &mod_time);
 
-					fclose(fp);
+					// Convert tm -> SYSTEMTIME
+					SYSTEMTIME st;
+					st.wYear = t_local.tm_year + 1900;
+					st.wMonth = t_local.tm_mon + 1;
+					st.wDay = t_local.tm_mday;
+					st.wHour = t_local.tm_hour;
+					st.wMinute = t_local.tm_min;
+					st.wSecond = t_local.tm_sec;
+					st.wMilliseconds = 0;
 
-					// preserve timestamp
-					{
-						FILETIME ftCreate, ftAccess, ftWrite;
-						SYSTEMTIME st;
-						HANDLE hFile = CreateFile(out_filename, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-						if (hFile != INVALID_HANDLE_VALUE)
-						{
-							// populate SYSTEMTIME from unz_file_info
-							st.wYear = fileinfo.tmu_date.tm_year;
-							st.wMonth = fileinfo.tmu_date.tm_mon;
-							st.wDay = fileinfo.tmu_date.tm_mday;
-							st.wHour = fileinfo.tmu_date.tm_hour;
-							st.wMinute = fileinfo.tmu_date.tm_min;
-							st.wSecond = fileinfo.tmu_date.tm_sec;
-							st.wMilliseconds = 0;
+					// Convert local SYSTEMTIME -> UTC FILETIME
+					FILETIME ft;
+					SystemTimeToFileTime(&st, &ft);          // gives UTC FILETIME corresponding to local time
+					FILETIME ft_local;
+					LocalFileTimeToFileTime(&ft, &ft_local); // adjust for local->UTC so timestamp is exact
 
-							// convert SYSTEMTIME to FILETIME
-							if (SystemTimeToFileTime(&st, &ftWrite))
-							{
-								// optionally set create/access times to same as modified
-								ftCreate = ftAccess = ftWrite;
-								SetFileTime(hFile, &ftCreate, &ftAccess, &ftWrite);
-							}
-							CloseHandle(hFile);
-						}
-					}
+					// Apply to file
+					SetFileTime(hFile, NULL, &ft_local, &ft_local);
 				}
-				else
-				{
-					unzClose(f);
-					pushstring(_T("Error opening output file(s)"));
-					g_extracting=0;
-					return;
-				}
-				nf++;
 
-				int quit=0;
-				if (g_hwndParent)
-				{
-					MSG msg;				
-					while (PeekMessage(&msg,NULL,0,0,PM_REMOVE))
-					{
-						if (msg.message == WM_DESTROY && msg.hwnd == g_hwndParent) 
-						{
-							quit++;
-							break;
-						}
-						TranslateMessage(&msg);
-						DispatchMessage(&msg);
-					}
-				}
-				unzCloseCurrentFile(f);
-				if (quit) break;
+                fclose(fp);
+		        filecount++;
+		        mz_zip_reader_entry_close(reader);
+
+				// wsprintf(msgbuf, _T("Wrote %ld bytes to:\n%s"), totalWritten, outFile);
+				// MessageBox(NULL, msgbuf, _T("nsisunz Debug"), MB_OK);
+                // Log extraction of this file
+	            if (uselog) {
+	                TCHAR msg[1024];
+	                wsprintf(msg, _T("Extracted: %s"), outFile);
+	                DetailPrint(msg);
+	            }
 			}
-			else
-			{
-				unzClose(f);
-				pushstring(_T("Error extracting from ZIP file"));
-				g_extracting=0;
-				return;
-			}
-		}
-	} while (unzGoToNextFile(f) == UNZ_OK);
+        }
 
-	g_extracting=0;
-	if (usefile && !filefound) {
-		pushstring(_T("File not found in archive"));
-	} else {
-		pushstring(szSuccess);
-	}
-	unzClose(f);
-	return;
+	} while (mz_zip_reader_goto_next_entry(reader) == MZ_OK);
+
+	// Free buffer
+	delete[] buffer;
+
+	mz_zip_reader_close(reader);
+	mz_zip_reader_delete(&reader);
+
+	pushstring(_T("success"));
 }
-
-// Tim Kosse's LogMessage
-void LogMessage(HWND hwndParent, const TCHAR *pStr, int changelast) {
-	static HWND hwndList=0;
-	static HWND hwndStatus=0;
-	LVITEM item={0};
-	int nItemCount;
-	if (!hwndParent) return;
-
-	EnterCriticalSection(&cs);
-
-	//Get ListView control on instfiles page (the log)
-	if (!hwndList) hwndList = FindWindowEx(
-		FindWindowEx(hwndParent, NULL, _T("#32770"), NULL),
-		NULL, _T("SysListView32"), NULL);
-
-	//Get status "STATIC" control above progressbar
-	if (!hwndStatus) hwndStatus = GetDlgItem(
-		FindWindowEx(hwndParent, NULL, _T("#32770"), NULL),
-		1006);
-	
-	if (!hwndList || !hwndStatus) return;
-
-	SendMessage(hwndStatus, WM_SETTEXT, 0, (LPARAM)pStr);//added by Saivert
-	nItemCount=SendMessage(hwndList, LVM_GETITEMCOUNT, 0, 0);
-
-	item.mask=LVIF_TEXT;
-	item.pszText=(TCHAR *)pStr;
-	item.cchTextMax=0;
-	item.iItem=changelast?nItemCount-1:nItemCount;
-
-	if (changelast) {
-		ListView_SetItem(hwndList, &item);
-	} else {
-		ListView_InsertItem(hwndList, &item);
-	}
-	ListView_EnsureVisible(hwndList, item.iItem, 0);
-
-	LeaveCriticalSection(&cs);
-}
-
-// EXPERIMENTAL THREAD BASED EXTRACTION
-/*
-extern "C" __declspec(dllexport)
-UnzipToLogUsingThread(HWND hwndParent, int string_size, char *variables, stack_t **stacktop)
-{
-	MSG msg;
-	DWORD dwTID;
-
-	CreateThread(NULL, 0, UnzipThread, (LPVOID)1, 0, &dwTID);
-}
-
-DWORD WINAPI UnzipThread(LPVOID p)
-{
-	int uselog = 1;
-	return 0;
-}
-*/
-#ifdef UNICODE
-unsigned char staticCnvBuffer[1024*sizeof(TCHAR)]; /* temp buffer, holds ASCII & UNICODE string after conversion */
-char * _T2A(wchar_t *wideStr)
-{
-	WideCharToMultiByte(CP_ACP, 0, wideStr, -1, (LPSTR)staticCnvBuffer, sizeof(staticCnvBuffer), NULL, NULL);
-	return (char *)staticCnvBuffer;
-}
-wchar_t * _A2T(char *ansiStr)
-{
-	MultiByteToWideChar(CP_ACP, 0, ansiStr, -1, (TCHAR *)staticCnvBuffer, sizeof(staticCnvBuffer)/sizeof(TCHAR));
-	return (wchar_t *)staticCnvBuffer;
-}
-#endif
