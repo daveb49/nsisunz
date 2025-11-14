@@ -11,6 +11,16 @@
 #include <stdio.h>
 #include <commctrl.h>
 #include <io.h>			// for _get_osfhandle
+
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+
+#include <time.h>
+#include <stdint.h>
+#include <algorithm> // for std::min
+
 #include "nsis/pluginapi.h"
 
 #ifdef _MSC_VER
@@ -20,6 +30,7 @@
 
 #include "minizip-ng/mz.h"
 #include "minizip-ng/mz_strm.h"
+#include "minizip-ng/mz_strm_mem.h"
 #include "minizip-ng/mz_zip.h"
 #include "minizip-ng/mz_zip_rw.h"
 #include <shlwapi.h> // for PathRemoveFileSpec
@@ -173,6 +184,125 @@ void ReplaceChar(TCHAR* str, TCHAR find, TCHAR replace) {
     }
 }
 
+FILE* log_fp = NULL;
+
+static void LogDebug(const char* fmt, ...)
+{
+    if (!log_fp) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(log_fp, fmt, args);
+    fflush(log_fp);
+    va_end(args);
+}
+
+void ApplyZipTimestamp(FILE* fp, const mz_zip_file* file_info)
+{
+	if (!fp || !file_info)
+		return;
+
+	LogDebug("=== ApplyZipTimestamp ===\n");
+
+	const uint8_t* extra = file_info->extrafield;
+	size_t extra_size = file_info->extrafield_size;
+
+	LogDebug("Extra field size: %zu\n", (size_t)extra_size);
+
+	if (extra && extra_size > 0)
+	{
+		LogDebug("Extra field bytes:\n");
+		for (size_t i = 0; i < extra_size; ++i)
+		{
+			LogDebug("%02X ", extra[i]);
+			if ((i + 1) % 16 == 0) LogDebug("\n");
+		}
+		LogDebug("\n");
+	}
+
+	// Fallback to DOS time
+	if (!extra || extra_size < 32)
+	{
+		uint32_t dos = file_info->modified_date;
+		LogDebug("Using DOS timestamp: raw=0x%08X\n", dos);
+
+		FILETIME ft;
+		DWORD dos_date = (dos >> 16) & 0xFFFF;
+		DWORD dos_time = dos & 0xFFFF;
+
+		if (!DosDateTimeToFileTime((WORD)dos_date, (WORD)dos_time, &ft))
+		{
+			LogDebug("Failed to convert DOS time\n");
+		}
+		else
+		{
+			LogDebug("DOS->FILETIME=0x%08I64X\n", *((unsigned __int64*)&ft));
+
+			if (SetFileTime((HANDLE)_get_osfhandle(_fileno(fp)), nullptr, nullptr, &ft))
+				LogDebug("SetFileTime succeeded (DOS)\n");
+			else
+				LogDebug("SetFileTime failed (DOS)\n");
+		}
+
+		LogDebug("=========================\n");
+		return;
+	}
+
+	// NTFS parsing
+	const uint8_t* p = extra;
+	const uint8_t* end = extra + extra_size;
+
+	while (p + 4 <= end)
+	{
+		uint16_t header_id = p[0] | (p[1] << 8);
+		uint16_t data_size = p[2] | (p[3] << 8);
+		LogDebug("Found extra header: 0x%04X, size=%u\n", header_id, data_size);
+		p += 4;
+
+		if (header_id == 0x000A && data_size >= 32) // NTFS
+		{
+			const uint8_t* t = p;
+			const uint8_t* t_end = p + data_size;
+
+			while (t + 4 <= t_end)
+			{
+				uint16_t tag = t[0] | (t[1] << 8);
+				uint16_t size = t[2] | (t[3] << 8);
+				t += 4;
+
+				LogDebug("  NTFS tag=0x%04X, size=%u\n", tag, size);
+
+				if (tag == 0x0001 && size >= 24)
+				{
+					FILETIME ctime, atime, mtime;
+					memcpy(&ctime, t, 8);
+					memcpy(&atime, t + 8, 8);
+					memcpy(&mtime, t + 16, 8);
+
+					LogDebug("  ctime=0x%08I64X\n", *((unsigned __int64*)&ctime));
+					LogDebug("  atime=0x%08I64X\n", *((unsigned __int64*)&atime));
+					LogDebug("  mtime=0x%08I64X\n", *((unsigned __int64*)&mtime));
+
+					if (SetFileTime((HANDLE)_get_osfhandle(_fileno(fp)), &ctime, nullptr, &mtime))
+						LogDebug("SetFileTime succeeded (NTFS)\n");
+					else
+						LogDebug("SetFileTime failed (NTFS)\n");
+
+					break;
+				}
+
+				t += size;
+			}
+
+			break;
+		}
+
+		p += data_size;
+	}
+
+	LogDebug("=========================\n");
+}
+
+
 void internal_unzip(int uselog) {
     TCHAR zipPath[MAX_PATH];
     if (popstring(zipPath)) {
@@ -208,6 +338,8 @@ void internal_unzip(int uselog) {
         mz_zip_reader_delete(&reader);
         return;
     }
+
+	_tfopen_s(&log_fp, _T("xxx_nsisunz_debug.log"), _T("w"));
 
     int filecount = 0;
 	do {
@@ -252,41 +384,15 @@ void internal_unzip(int uselog) {
                     }
 	            } while (bytesRead > 0);
 
-                // --- Set exact file timestamp (local ZIP wall-clock) ---
-                fflush(fp); // ensure all data is written
+				mz_zip_reader_entry_close(reader);
 
-                int fd = _fileno(fp);
-                HANDLE hFile = (HANDLE)_get_osfhandle(fd);
-                if (hFile != INVALID_HANDLE_VALUE) {
-					time_t mod_time = (time_t)file_info->modified_date;
+				// --- Set exact file timestamp ---
+				fflush(fp);
 
-					// Convert to broken-down local time (tm)
-					struct tm t_local;
-					localtime_s(&t_local, &mod_time);
+				ApplyZipTimestamp(fp, file_info);
 
-					// Convert tm -> SYSTEMTIME
-					SYSTEMTIME st;
-					st.wYear = t_local.tm_year + 1900;
-					st.wMonth = t_local.tm_mon + 1;
-					st.wDay = t_local.tm_mday;
-					st.wHour = t_local.tm_hour;
-					st.wMinute = t_local.tm_min;
-					st.wSecond = t_local.tm_sec;
-					st.wMilliseconds = 0;
-
-					// Convert local SYSTEMTIME -> UTC FILETIME
-					FILETIME ft;
-					SystemTimeToFileTime(&st, &ft);          // gives UTC FILETIME corresponding to local time
-					FILETIME ft_local;
-					LocalFileTimeToFileTime(&ft, &ft_local); // adjust for local->UTC so timestamp is exact
-
-					// Apply to file
-					SetFileTime(hFile, NULL, &ft_local, &ft_local);
-				}
-
-                fclose(fp);
-		        filecount++;
-		        mz_zip_reader_entry_close(reader);
+				fclose(fp);
+				filecount++;
 
 				// wsprintf(msgbuf, _T("Wrote %ld bytes to:\n%s"), totalWritten, outFile);
 				// MessageBox(NULL, msgbuf, _T("nsisunz Debug"), MB_OK);
@@ -306,6 +412,8 @@ void internal_unzip(int uselog) {
 
 	mz_zip_reader_close(reader);
 	mz_zip_reader_delete(&reader);
+
+	if (log_fp) fclose(log_fp);
 
 	pushstring(_T("success"));
 }
