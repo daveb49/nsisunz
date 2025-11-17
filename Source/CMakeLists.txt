@@ -35,12 +35,6 @@ target_link_libraries(nsisunz_unicode PRIVATE
     "${NSIS_PLUGIN_LIB_DEST}/pluginapi-amd64-unicode.lib"
 )
 
-# --- Include directories ---
-target_include_directories(nsisunz_unicode PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    minizip-ng
-)
-
 # Optional: set C++ standard
 set_target_properties(nsisunz_unicode PROPERTIES
     CXX_STANDARD 17

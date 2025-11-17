@@ -14,8 +14,8 @@
 
 #include <string>
 #include <sstream>
-#include <iomanip>
-#include <ctime>
+//#include <iomanip>
+//#include <ctime>
 
 #include <time.h>
 #include <stdint.h>
@@ -23,16 +23,25 @@
 
 #include "nsis/pluginapi.h"
 
+#include "zlib.h"       // zlib
+#include "zip.h"        // libzip
+#include "zipint.h"     // libzip internal zip_extra_field_t structures
+#include <cstdint>
+
+#pragma comment(lib, "zip.lib")
+#pragma comment(lib, "zs.lib")
+
+#define ZIPDEBUG
+#ifdef ZIPDEBUG
+#include <iomanip>
+#include <ctime>
+#endif
+
 #ifdef _MSC_VER
 #pragma comment(lib, "pluginapi-amd64-unicode.lib")
 #endif
 #pragma comment(lib,"Shlwapi.lib")
 
-#include "minizip-ng/mz.h"
-#include "minizip-ng/mz_strm.h"
-#include "minizip-ng/mz_strm_mem.h"
-#include "minizip-ng/mz_zip.h"
-#include "minizip-ng/mz_zip_rw.h"
 #include <shlwapi.h> // for PathRemoveFileSpec
 
 static HWND g_hwndParent = NULL;
@@ -222,14 +231,14 @@ bool TimeT_ToFileTime_ExplorerWillShowLocal(time_t mtime, FILETIME& outFtUtc) {
     return true;
 }
 
-void ApplyZipTimestamp(FILE* fp, const mz_zip_file* file_info)
+void ApplyZipTimestamp(FILE* fp, uint32_t mtime)
 {
-	if (!fp || !file_info)
+	if (!fp)
 		return;
 
 	LogDebug("=== ApplyZipTimestamp ===\n");
 
-	uint32_t mtime = file_info->modified_date;
+	// uint32_t mtime = file_info->modified_date;
 	LogDebug("Using modified_date: %d = 0x%08X\n", mtime, mtime);
 
 	FILETIME ft;
@@ -261,46 +270,53 @@ void internal_unzip(int uselog) {
         return;
     }
 
-    void* reader = mz_zip_reader_create();
-    if (mz_zip_reader_open_file(reader, _T2A(zipPath)) != MZ_OK) {
-        mz_zip_reader_delete(&reader);
-        pushstring(_T("Error opening ZIP file"));
+	int err = 0;
+	zip_t* za = zip_open(_T2A(zipPath), ZIP_RDONLY, &err);
+    if (! za) {
+		TCHAR msg[1024];
+		wsprintf(msg, _T("Error %d opening ZIP file"), err);
+        pushstring(msg);
         return;
     }
 
-    if (mz_zip_reader_goto_first_entry(reader) != MZ_OK) {
-        mz_zip_reader_close(reader);
-        mz_zip_reader_delete(&reader);
+	zip_int64_t num = zip_get_num_entries(za, 0);
+    if (num == 0) {
+		zip_close(za);
         pushstring(_T("ZIP file has no entries"));
         return;
     }
 
     // Allocate 1 MB buffer on heap once, reuse for all files unpacked from the zip
-    uint8_t* buffer = (uint8_t*)malloc(1024 * 1024);
+    char* buffer = (char*)malloc(1024 * 1024);
     if (!buffer) {
-        pushstring(_T("Failed to allocate extraction buffer"));
-        mz_zip_reader_close(reader);
-        mz_zip_reader_delete(&reader);
+		zip_close(za);
+		pushstring(_T("Failed to allocate extraction buffer"));
         return;
     }
 
+#ifdef ZIPDEBUG
 	_tfopen_s(&log_fp, _T("xxx_nsisunz_debug.log"), _T("w"));
+#endif
 
     int filecount = 0;
-	do {
-	    mz_zip_file* file_info = nullptr;
-	    if (mz_zip_reader_entry_get_info(reader, &file_info) != MZ_OK || !file_info)
-	        continue;
+	for (zip_uint64_t index = 0; index < (zip_uint64_t)num; index++) {
+		zip_stat_t st;
+		if (zip_stat_index(za, index, ZIP_STAT_NAME | ZIP_STAT_SIZE | ZIP_STAT_MTIME, &st) != 0) {
+			zip_close(za);
+			pushstring(_T("Failed extract (zip_stat_index )"));
+			return;
+		}
 
 	    // Convert filename to TCHAR
 	    TCHAR entryName[MAX_PATH];
-	    lstrcpyn(entryName, _A2T(file_info->filename), MAX_PATH);
+	    lstrcpyn(entryName, _A2T(st.name), MAX_PATH);
         ReplaceChar(entryName, _T('/'), _T('\\'));
 
         // Skip directory entries
-        if (file_info->uncompressed_size == 0 && _tcschr(entryName, _T('/')) && entryName[_tcslen(entryName) - 1] == _T('/')) {
+        if (st.size == 0 && _tcschr(entryName, _T('/')) && entryName[_tcslen(entryName) - 1] == _T('/')) {
             continue;
         }
+
 		// Build full output path
 	    TCHAR outFile[MAX_PATH];
 	    lstrcpyn(outFile, destPath, MAX_PATH);
@@ -315,48 +331,78 @@ void internal_unzip(int uselog) {
 	    doMKDir(dirBuf);
 
 	    // Open entry and write to disk
-	    if (mz_zip_reader_entry_open(reader) == MZ_OK) {
-	        FILE* fp = nullptr;
-	        _tfopen_s(&fp, outFile, _T("wb"));
-	        if (fp) {
-	            int32_t bytesRead = 0;
-                long totalWritten = 0;
-	            do {
-	                bytesRead = mz_zip_reader_entry_read(reader, buffer, 1024 * 1024);
-                    if (bytesRead > 0) {
-                        fwrite(buffer, 1, bytesRead, fp);
-                        totalWritten += bytesRead;
-                    }
-	            } while (bytesRead > 0);
+		zip_file_t* zf = zip_fopen_index(za, index, 0);
+		if (zf) {
+			// Create output file
+			HANDLE hOut = CreateFile(
+				outFile,
+				GENERIC_WRITE,
+				0,
+				NULL,
+				CREATE_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL,
+				NULL);
 
-				mz_zip_reader_entry_close(reader);
-
-				// --- Set exact file timestamp ---
-				fflush(fp);
-
-				ApplyZipTimestamp(fp, file_info);
-
-				fclose(fp);
-				filecount++;
-
-				// wsprintf(msgbuf, _T("Wrote %ld bytes to:\n%s"), totalWritten, outFile);
-				// MessageBox(NULL, msgbuf, _T("nsisunz Debug"), MB_OK);
-                // Log extraction of this file
-	            if (uselog) {
-	                TCHAR msg[1024];
-	                wsprintf(msg, _T("Extracted: %s"), outFile);
-	                DetailPrint(msg);
-	            }
+			if (hOut == INVALID_HANDLE_VALUE) {
+				zip_fclose(zf);
+				TCHAR msg[1024];
+				wsprintf(msg, _T("While extracting [%s], CreateFile failed"), outFile);
+				DetailPrint(msg);
+				continue;
 			}
+
+			LogDebug("Extracting: %ls\n", outFile);
+
+			zip_int64_t bytesRead = 0;
+			long totalWritten = 0;
+			while ((bytesRead = zip_fread(zf, buffer, 1024 * 1024)) > 0) {
+				DWORD written;
+				WriteFile(hOut, buffer, bytesRead, &written, NULL);
+				totalWritten += written;
+			}
+
+			// Flush file buffers to disk before setting times
+			FlushFileBuffers(hOut);
+
+			// Apply modified time
+			BOOL ok = false;
+			if (st.valid & ZIP_STAT_MTIME) {
+				time_t mtime = st.mtime;
+				FILETIME ft{};
+				if (!TimeT_ToFileTime_ExplorerWillShowLocal(mtime, ft)) {
+					LogDebug("[DEBUG] TimeT_ToFileTime_ExplorerWillShowLocal failed!\n");
+				} else {
+					ok = SetFileTime(hOut, NULL, NULL, &ft);
+				}
+			}
+#ifdef ZIPDEBUG
+			if (!ok)
+				LogDebug("[DEBUG] SetFileTime failed!\n");
+			else
+				LogDebug("[DEBUG] SetFileTime applied successfully.\n");
+#else
+			ok; // unused
+#endif
+			CloseHandle(hOut);
+			zip_fclose(zf);
+			filecount++;
+
+			// wsprintf(msgbuf, _T("Wrote %ld bytes to:\n%s"), totalWritten, outFile);
+			// MessageBox(NULL, msgbuf, _T("nsisunz Debug"), MB_OK);
+            // Log extraction of this file
+
+			if (uselog) {
+	            TCHAR msg[1024];
+	            wsprintf(msg, _T("Extracted: %s"), outFile);
+	            DetailPrint(msg);
+	        }
         }
 
-	} while (mz_zip_reader_goto_next_entry(reader) == MZ_OK);
+	}
 
 	// Free buffer
 	delete[] buffer;
-
-	mz_zip_reader_close(reader);
-	mz_zip_reader_delete(&reader);
+	zip_close(za);
 
 	if (log_fp) fclose(log_fp);
 

@@ -1,0 +1,58 @@
+
+C:\DevNSIS\libzip>date
+The current date is: Sat 15/11/2025
+Enter the new date: (dd-mm-yy)
+
+C:\DevNSIS\libzip>time
+The current time is: 17:42:36.83
+Enter the new time:
+
+C:\DevNSIS\libzip>cd build
+
+C:\DevNSIS\libzip\build>cmake .. -G "Visual Studio 17 2022" -A x64 ^
+More?     -DZLIB_LIBRARY=C:/DevNSIS/zlib/build/Release/zs.lib ^
+More?     -DZLIB_INCLUDE_DIR=C:/DevNSIS/zlib ^
+More?     -DBUILD_SHARED_LIBS=OFF
+-- Could NOT find PkgConfig (missing: PKG_CONFIG_EXECUTABLE)
+-- Could NOT find Nettle (missing: Nettle_LIBRARY Nettle_INCLUDE_DIR) (Required is at least version "3.0")
+-- Could NOT find GnuTLS (missing: GNUTLS_LIBRARY GNUTLS_INCLUDE_DIR)
+-- Could NOT find MbedTLS (missing: MbedTLS_LIBRARY MbedTLS_INCLUDE_DIR) (Required is at least version "1.0")
+-- Could NOT find OpenSSL, try to set the path to OpenSSL root folder in the system variable OPENSSL_ROOT_DIR (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)
+-- Could NOT find BZip2 (missing: BZIP2_LIBRARIES BZIP2_INCLUDE_DIR)
+CMake Warning at CMakeLists.txt:236 (message):
+  -- bzip2 library not found; bzip2 support disabled
+
+
+-- Could NOT find LibLZMA (missing: LIBLZMA_LIBRARY LIBLZMA_INCLUDE_DIR LIBLZMA_HAS_AUTO_DECODER LIBLZMA_HAS_EASY_ENCODER LIBLZMA_HAS_LZMA_PRESET) (Required is atleast version "5.2")
+CMake Warning at CMakeLists.txt:245 (message):
+  -- lzma library not found; lzma/xz support disabled
+
+
+-- Could NOT find PkgConfig (missing: PKG_CONFIG_EXECUTABLE)
+-- Could NOT find zstd (missing: _zstd_LIBRARY zstd_INCLUDE_DIR) (Required is at least version "1.4.0")
+CMake Warning at CMakeLists.txt:259 (message):
+  -- zstd library not found; zstandard support disabled
+
+
+CMake Warning at CMakeLists.txt:331 (message):
+  -- nihtest not found, regression testing disabled
+
+
+-- Configuring done (1.2s)
+CMake Error at lib/CMakeLists.txt:5 (add_library):
+  Cannot find source file:
+
+    zipint.c
+
+  Tried extensions .c .C .c++ .cc .cpp .cxx .cu .mpp .m .M .mm .ixx .cppm
+  .ccm .cxxm .c++m .h .hh .h++ .hm .hpp .hxx .in .txx .f .F .for .f77 .f90
+  .f95 .f03 .hip .ispc
+
+
+CMake Error at lib/CMakeLists.txt:5 (add_library):
+  No SOURCES given to target: zip
+
+
+CMake Generate step failed.  Build files cannot be regenerated correctly.
+
+C:\DevNSIS\libzip\build>
